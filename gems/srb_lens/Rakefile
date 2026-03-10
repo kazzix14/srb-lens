@@ -1,0 +1,7 @@
+require "rb_sys/extensiontask"
+
+RbSys::ExtensionTask.new("srb_lens") do |ext|
+  ext.lib_dir = "lib/srb_lens"
+end
+
+task default: :compile

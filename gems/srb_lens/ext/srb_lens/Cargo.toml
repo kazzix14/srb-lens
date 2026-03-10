@@ -1,0 +1,11 @@
+[package]
+name = "srb_lens_ruby"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = { version = "0.7", features = ["rb-sys"] }
+srb-lens = { path = "../../../../crates/srb-lens" }

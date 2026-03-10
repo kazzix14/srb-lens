@@ -1,6 +1,3 @@
-[package]
-name = "srb-lens"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
+[workspace]
+members = ["crates/srb-lens", "crates/srb-lens-cli", "gems/srb_lens/ext/srb_lens"]
+resolver = "3"
