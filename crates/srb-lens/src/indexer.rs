@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use crate::builder;
 use crate::model::Project;
@@ -143,12 +144,59 @@ pub fn load_from_cache(project_root: &Path) -> Result<Project, IndexError> {
     Ok(project)
 }
 
-/// キャッシュがあればロード、なければ index を実行
+/// キャッシュが古いか（.rb ファイルの最新 mtime がキャッシュより新しいか）
+pub fn cache_stale(project_root: &Path) -> bool {
+    let dir = cache_dir(project_root);
+    let cache_mtime = match fs::metadata(dir.join(CFG_FILE)).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+
+    max_rb_mtime(project_root)
+        .map(|rb_mtime| rb_mtime > cache_mtime)
+        .unwrap_or(false)
+}
+
+/// project_root 配下の .rb ファイルの最新 mtime を返す
+fn max_rb_mtime(project_root: &Path) -> Option<SystemTime> {
+    const SKIP_DIRS: &[&str] = &["vendor", "node_modules", "tmp", "log", ".git", ".srb-lens", "sorbet"];
+
+    fn walk(dir: &Path, max: &mut Option<SystemTime>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                    continue;
+                }
+                walk(&path, max);
+            } else if path.extension().is_some_and(|ext| ext == "rb") {
+                if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                    *max = Some(match *max {
+                        Some(cur) if cur >= mtime => cur,
+                        _ => mtime,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut max = None;
+    walk(project_root, &mut max);
+    max
+}
+
+/// キャッシュがあり新鮮ならロード、なければ/古ければ index を実行
 pub fn load_or_index(
     project_root: &Path,
     srb_command: &SrbCommand,
 ) -> Result<Project, IndexError> {
-    if cache_exists(project_root) {
+    if cache_exists(project_root) && !cache_stale(project_root) {
         load_from_cache(project_root)
     } else {
         index(project_root, srb_command)
