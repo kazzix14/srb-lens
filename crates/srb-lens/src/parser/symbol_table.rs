@@ -32,6 +32,12 @@ pub struct RawArgument {
     pub name: SymbolName,
     #[serde(rename = "isBlock")]
     pub is_block: Option<bool>,
+    #[serde(rename = "isDefault")]
+    pub is_default: Option<bool>,
+    #[serde(rename = "isKeyword")]
+    pub is_keyword: Option<bool>,
+    #[serde(rename = "isRepeated")]
+    pub is_repeated: Option<bool>,
 }
 
 impl SymbolTree {

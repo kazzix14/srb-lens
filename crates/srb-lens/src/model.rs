@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
+use serde::{Serialize, Serializer};
+
+use crate::builder::parse_sorbet_type;
 use crate::parser::parse_tree::MethodLoc;
 
 /// 3フォーマットを統合した全体像
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct Project {
     pub classes: HashMap<String, ClassInfo>,
     pub methods: Vec<MethodInfo>,
@@ -156,6 +159,11 @@ impl Project {
             }) {
                 method.file_path = Some(rel_path.clone());
                 method.line = Some(loc.line);
+
+                // sig の return type があれば CFG 推定より優先して適用
+                if let Some(ref sig_ret) = loc.sig_return_type {
+                    method.return_type = Some(parse_sorbet_type(sig_ret));
+                }
             }
         }
     }
@@ -169,6 +177,12 @@ pub struct MethodFqn {
     pub kind: MethodKind,
 }
 
+impl Serialize for MethodFqn {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 impl fmt::Display for MethodFqn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let sep = match self.kind {
@@ -179,26 +193,27 @@ impl fmt::Display for MethodFqn {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum MethodKind {
     Instance,
     Class,
 }
 
 /// クラス/モジュール情報
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClassInfo {
     pub fqn: String,
     pub is_module: bool,
     pub super_class: Option<String>,
     pub mixins: Vec<String>,
+    #[serde(skip)]
     pub method_fqns: Vec<MethodFqn>,
     pub file_path: Option<String>,
     pub line: Option<usize>,
 }
 
 /// メソッド情報
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct MethodInfo {
     pub fqn: MethodFqn,
     pub file_path: Option<String>,
@@ -209,6 +224,7 @@ pub struct MethodInfo {
     pub ivars: Vec<IvarAccess>,
     pub rescues: Vec<String>,
     pub uses_block: bool,
+    #[serde(skip)]
     pub basic_blocks: Vec<BasicBlock>,
 }
 
@@ -236,14 +252,26 @@ pub enum Terminator {
     Return,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArgumentKind {
+    Req,
+    Opt,
+    Rest,
+    KeyReq,
+    Key,
+    KeyRest,
+    Block,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Argument {
     pub name: String,
     pub ty: SorbetType,
-    pub is_optional: bool,
+    pub kind: ArgumentKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MethodCall {
     pub receiver_type: SorbetType,
     pub method_name: String,
@@ -253,13 +281,13 @@ pub struct MethodCall {
 }
 
 /// ある呼び出しに到達するために通った分岐条件
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BranchCondition {
     pub call: String,
     pub is_true: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IvarAccess {
     pub name: String,
     pub ty: SorbetType,
@@ -281,6 +309,12 @@ pub enum SorbetType {
     Untyped,
     NoReturn,
     Void,
+}
+
+impl Serialize for SorbetType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 impl fmt::Display for SorbetType {

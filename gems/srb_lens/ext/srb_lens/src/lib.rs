@@ -277,15 +277,24 @@ impl RbClassInfo {
 struct RbArgument {
     name: String,
     ty: String,
-    is_optional: bool,
+    kind: String,
 }
 
 impl RbArgument {
     fn from_model(a: &model::Argument) -> Self {
+        let kind = match a.kind {
+            model::ArgumentKind::Req => "req",
+            model::ArgumentKind::Opt => "opt",
+            model::ArgumentKind::Rest => "rest",
+            model::ArgumentKind::KeyReq => "keyreq",
+            model::ArgumentKind::Key => "key",
+            model::ArgumentKind::KeyRest => "keyrest",
+            model::ArgumentKind::Block => "block",
+        };
         Self {
             name: a.name.clone(),
             ty: a.ty.to_string(),
-            is_optional: a.is_optional,
+            kind: kind.to_string(),
         }
     }
 
@@ -297,8 +306,8 @@ impl RbArgument {
         &self.ty
     }
 
-    fn is_optional(&self) -> bool {
-        self.is_optional
+    fn kind(&self) -> &str {
+        &self.kind
     }
 }
 
@@ -452,7 +461,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let argument = module.define_class("Argument", ruby.class_object())?;
     argument.define_method("name", method!(RbArgument::name, 0))?;
     argument.define_method("type", method!(RbArgument::ty, 0))?;
-    argument.define_method("optional?", method!(RbArgument::is_optional, 0))?;
+    argument.define_method("kind", method!(RbArgument::kind, 0))?;
 
     // MethodCall
     let method_call = module.define_class("MethodCall", ruby.class_object())?;

@@ -1,5 +1,5 @@
 [package]
-name = "srb_lens_ruby"
+name = "srb_lens"
 version = "0.1.0"
 edition = "2024"
 

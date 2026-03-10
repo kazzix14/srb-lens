@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::model::*;
 use crate::parser::autogen::AutogenFile;
 use crate::parser::cfg_text::{AliasKind, CfgInstruction, CfgMethod, CfgTerminator};
-use crate::parser::symbol_table::SymbolTree;
+use crate::parser::symbol_table::{RawArgument, RawSymbol, SymbolTree};
 
 pub fn build(
     cfg_methods: Vec<CfgMethod>,
@@ -12,16 +12,21 @@ pub fn build(
 ) -> Project {
     let mut project = Project::default();
 
-    // 1. symbol-table → クラス情報
+    // 1. symbol-table → クラス情報 + 引数 kind マップ
     let id_map = symbol_tree.build_id_map();
     build_classes_from_symbols(&symbol_tree.root, "", &id_map, &mut project);
+    let arg_kinds = collect_arg_kinds(&symbol_tree.root, "", false);
 
     // 2. autogen → ファイルパスと行番号をクラスに紐付け
     apply_autogen(&autogen_files, &mut project);
 
     // 3. cfg-text → メソッド情報
     for cfg_method in &cfg_methods {
-        if let Some(method_info) = extract_method_info(cfg_method) {
+        if let Some(mut method_info) = extract_method_info(cfg_method) {
+            // symbol-table から引数 kind を適用
+            if let Some(kinds) = arg_kinds.get(&method_info.fqn.to_string()) {
+                apply_arg_kinds(&mut method_info.arguments, kinds);
+            }
             // クラスの method_fqns にも追加
             if let Some(class) = project.classes.get_mut(&method_info.fqn.class_fqn) {
                 class.method_fqns.push(method_info.fqn.clone());
@@ -202,7 +207,7 @@ fn extract_method_info(cfg_method: &CfgMethod) -> Option<MethodInfo> {
                     arguments.push(Argument {
                         name: arg_name.clone(),
                         ty: parse_sorbet_type(&lhs.ty),
-                        is_optional: false, // updated later
+                        kind: ArgumentKind::Req, // refined by symbol-table and ArgPresent
                     });
                 }
                 CfgInstruction::ArgPresent { arg_name, .. } => {
@@ -224,11 +229,28 @@ fn extract_method_info(cfg_method: &CfgMethod) -> Option<MethodInfo> {
                             conditions: Vec::new(), // filled in later
                         });
                     }
+                    // ivar write: @booths$4: Booth::PrivateRelation = recv.method()
+                    if lhs.name.starts_with('@') {
+                        ivars.push(IvarAccess {
+                            name: strip_ssa_suffix(&lhs.name).to_string(),
+                            ty: parse_sorbet_type(&lhs.ty),
+                        });
+                    }
                 }
                 CfgInstruction::Alias { kind, lhs, .. } => {
                     if let AliasKind::Ivar(name) = kind {
                         ivars.push(IvarAccess {
                             name: name.clone(),
+                            ty: parse_sorbet_type(&lhs.ty),
+                        });
+                    }
+                }
+                // ivar write via assignment or cast
+                CfgInstruction::Assignment { lhs, .. }
+                | CfgInstruction::Cast { lhs, .. } => {
+                    if lhs.name.starts_with('@') {
+                        ivars.push(IvarAccess {
+                            name: strip_ssa_suffix(&lhs.name).to_string(),
                             ty: parse_sorbet_type(&lhs.ty),
                         });
                     }
@@ -279,16 +301,26 @@ fn extract_method_info(cfg_method: &CfgMethod) -> Option<MethodInfo> {
         }
     }
 
-    // Mark optional arguments
+    // Mark optional arguments (fallback: symbol-table kind will override later)
     for arg in &mut arguments {
-        if optional_args.contains(&arg.name) {
-            arg.is_optional = true;
+        if optional_args.contains(&arg.name) && arg.kind == ArgumentKind::Req {
+            arg.kind = ArgumentKind::Opt;
         }
     }
 
-    // Deduplicate ivars by name
+    // Deduplicate ivars by name, preferring typed over T.untyped
     ivars.sort_by(|a, b| a.name.cmp(&b.name));
-    ivars.dedup_by(|a, b| a.name == b.name);
+    ivars.dedup_by(|a, b| {
+        if a.name == b.name {
+            // b is kept, a is removed. Transfer the typed version to b.
+            if b.ty == SorbetType::Untyped && a.ty != SorbetType::Untyped {
+                b.ty = a.ty.clone();
+            }
+            true
+        } else {
+            false
+        }
+    });
 
     // Build basic block graph
     let basic_blocks = build_basic_blocks(cfg_method);
@@ -299,14 +331,18 @@ fn extract_method_info(cfg_method: &CfgMethod) -> Option<MethodInfo> {
         call.conditions = compute_conditions(call.bb_id, &basic_blocks, &predecessors);
     }
 
-    let return_type = if return_types.is_empty() {
+    // 具体型があれば T.untyped を無視する
+    let concrete: Vec<SorbetType> = return_types
+        .into_iter()
+        .filter(|t| *t != SorbetType::Untyped)
+        .collect();
+    let return_type = if concrete.is_empty() {
+        // 全て T.untyped か return_types が空
         None
-    } else if return_types.contains(&SorbetType::Untyped) {
-        Some(SorbetType::Untyped)
-    } else if return_types.len() == 1 {
-        Some(return_types.remove(0))
+    } else if concrete.len() == 1 {
+        Some(concrete.into_iter().next().unwrap())
     } else {
-        Some(SorbetType::Union(return_types))
+        Some(SorbetType::Union(concrete))
     };
 
     Some(MethodInfo {
@@ -515,13 +551,101 @@ fn compute_conditions(
     conditions
 }
 
+/// symbol-table を走査してメソッド FQN → 引数 kind マップを構築
+fn collect_arg_kinds(
+    symbol: &RawSymbol,
+    class_fqn: &str,
+    is_singleton: bool,
+) -> HashMap<String, Vec<(String, ArgumentKind)>> {
+    let mut result = HashMap::new();
+    match symbol.kind.as_str() {
+        "CLASS_OR_MODULE" => {
+            let (new_fqn, new_singleton) = if symbol.name.name == "<root>" {
+                (String::new(), false)
+            } else if symbol.name.name.starts_with("<Class:") {
+                // singleton class — 中のメソッドはクラスメソッド
+                (class_fqn.to_string(), true)
+            } else {
+                let fqn = if class_fqn.is_empty() {
+                    symbol.name.name.clone()
+                } else {
+                    format!("{class_fqn}::{}", symbol.name.name)
+                };
+                (fqn, false)
+            };
+            if let Some(children) = &symbol.children {
+                for child in children {
+                    result.extend(collect_arg_kinds(child, &new_fqn, new_singleton));
+                }
+            }
+        }
+        "METHOD" => {
+            if symbol.name.name.starts_with('<') {
+                return result;
+            }
+            let sep = if is_singleton { "." } else { "#" };
+            let method_fqn = format!("{class_fqn}{sep}{}", symbol.name.name);
+            if let Some(args) = &symbol.arguments {
+                let kinds: Vec<(String, ArgumentKind)> = args
+                    .iter()
+                    .filter(|a| a.is_block != Some(true))
+                    .map(|a| (a.name.name.clone(), determine_arg_kind(a)))
+                    .collect();
+                result.insert(method_fqn, kinds);
+            }
+        }
+        _ => {}
+    }
+    result
+}
+
+fn determine_arg_kind(arg: &RawArgument) -> ArgumentKind {
+    let is_block = arg.is_block == Some(true);
+    let is_keyword = arg.is_keyword == Some(true);
+    let is_repeated = arg.is_repeated == Some(true);
+    let is_default = arg.is_default == Some(true);
+
+    if is_block {
+        ArgumentKind::Block
+    } else if is_repeated && is_keyword {
+        ArgumentKind::KeyRest
+    } else if is_repeated {
+        ArgumentKind::Rest
+    } else if is_keyword && is_default {
+        ArgumentKind::Key
+    } else if is_keyword {
+        ArgumentKind::KeyReq
+    } else if is_default {
+        ArgumentKind::Opt
+    } else {
+        ArgumentKind::Req
+    }
+}
+
+/// symbol-table の引数 kind 情報を CFG 由来の引数リストに適用
+fn apply_arg_kinds(arguments: &mut [Argument], kinds: &[(String, ArgumentKind)]) {
+    for arg in arguments.iter_mut() {
+        if let Some((_, kind)) = kinds.iter().find(|(name, _)| *name == arg.name) {
+            arg.kind = *kind;
+        }
+    }
+}
+
+/// Strip SSA suffix ($N) from a variable name: @booths$4 → @booths
+fn strip_ssa_suffix(name: &str) -> &str {
+    match name.rfind('$') {
+        Some(pos) => &name[..pos],
+        None => name,
+    }
+}
+
 /// Magic 内部メソッドかどうか判定
 fn is_magic_method(method_name: &str, receiver_type: &str) -> bool {
     receiver_type.contains("<Magic>")
         || (method_name.starts_with('<') && method_name.contains('-'))
 }
 
-fn parse_sorbet_type(s: &str) -> SorbetType {
+pub fn parse_sorbet_type(s: &str) -> SorbetType {
     let s = s.trim();
     if s.is_empty() || s == "T.untyped" {
         return SorbetType::Untyped;
@@ -679,8 +803,11 @@ bb0[firstDead=-1]():
     <self>: Campaign = cast(<self>: NilClass, Campaign);
     at: Time = load_arg(at)
     <argPresent>$3: T::Boolean = arg_present(at)
-    @start_at$4: T.untyped = alias @start_at
+    @start_at$4: T.untyped = alias <C <undeclared-field-stub>> (@start_at)
     <statTemp>$5: Time = <self>: Campaign.start_at()
+    @booths$6: T.untyped = alias <C <undeclared-field-stub>> (@booths)
+    <statTemp>$7: Account = <self>: Campaign.current_account!()
+    @booths$6: Booth::PrivateRelation = <statTemp>$7: Account.booths()
     <returnMethodTemp>$2: T::Boolean = <statTemp>$5: Time.<=>(at: Time)
     <finalReturn>: T.noreturn = return <returnMethodTemp>$2: T::Boolean
     <unconditional> -> bb1
@@ -749,10 +876,304 @@ requires: []
         assert_eq!(m.fqn.to_string(), "Campaign#active?");
         assert_eq!(m.arguments.len(), 1);
         assert_eq!(m.arguments[0].name, "at");
-        assert!(m.arguments[0].is_optional);
-        assert_eq!(m.ivars.len(), 1);
-        assert_eq!(m.ivars[0].name, "@start_at");
+        assert_eq!(m.arguments[0].kind, ArgumentKind::Opt);
+        assert_eq!(m.ivars.len(), 2);
+        let booths_ivar = m.ivars.iter().find(|iv| iv.name == "@booths").unwrap();
+        assert_eq!(booths_ivar.ty, SorbetType::Simple("Booth::PrivateRelation".into()));
+        let start_at_ivar = m.ivars.iter().find(|iv| iv.name == "@start_at").unwrap();
+        assert_eq!(start_at_ivar.ty, SorbetType::Untyped);
         assert!(m.calls.iter().any(|c| c.method_name == "start_at"));
         assert!(m.calls.iter().any(|c| c.method_name == "<=>"));
+    }
+
+    #[test]
+    fn test_argument_kinds_from_symbol_table() {
+        // def search(query, *tags, limit: 10, **opts)
+        let cfg_input = r#"method ::Foo#search {
+
+bb0[firstDead=-1]():
+    <self>: Foo = cast(<self>: NilClass, Foo);
+    query: String = load_arg(query)
+    tags: T::Array[String] = load_arg(tags)
+    limit: Integer = load_arg(limit)
+    <argPresent>$3: T::Boolean = arg_present(limit)
+    opts: T::Hash[Symbol, T.untyped] = load_arg(opts)
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+}"#;
+
+        let symbol_json = r#"{
+            "id": 24,
+            "name": { "kind": "CONSTANT", "name": "<root>" },
+            "kind": "CLASS_OR_MODULE",
+            "children": [
+                {
+                    "id": 100,
+                    "name": { "kind": "CONSTANT", "name": "Foo" },
+                    "kind": "CLASS_OR_MODULE",
+                    "children": [
+                        {
+                            "id": 1001,
+                            "name": { "kind": "UTF8", "name": "search" },
+                            "kind": "METHOD",
+                            "arguments": [
+                                { "name": { "kind": "UTF8", "name": "query" } },
+                                { "name": { "kind": "UTF8", "name": "tags" }, "isRepeated": true },
+                                { "name": { "kind": "UTF8", "name": "limit" }, "isKeyword": true, "isDefault": true },
+                                { "name": { "kind": "UTF8", "name": "opts" }, "isKeyword": true, "isRepeated": true },
+                                { "name": { "kind": "UTF8", "name": "<blk>" }, "isBlock": true }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let cfg_methods = cfg_text::parse(cfg_input).unwrap();
+        let symbol_tree = symbol_table::parse(symbol_json).unwrap();
+        let autogen_files = autogen::parse("").unwrap();
+
+        let project = build(cfg_methods, symbol_tree, autogen_files);
+
+        let methods = project.find_methods("Foo#search");
+        assert_eq!(methods.len(), 1);
+        let m = &methods[0];
+        assert_eq!(m.arguments.len(), 4);
+        assert_eq!(m.arguments[0].name, "query");
+        assert_eq!(m.arguments[0].kind, ArgumentKind::Req);
+        assert_eq!(m.arguments[1].name, "tags");
+        assert_eq!(m.arguments[1].kind, ArgumentKind::Rest);
+        assert_eq!(m.arguments[2].name, "limit");
+        assert_eq!(m.arguments[2].kind, ArgumentKind::Key);
+        assert_eq!(m.arguments[3].name, "opts");
+        assert_eq!(m.arguments[3].kind, ArgumentKind::KeyRest);
+    }
+
+    #[test]
+    fn test_return_type_concrete_preferred_over_untyped() {
+        // ||= パターン: bb0 が T.untyped を return し、bb2 が具体型を return する
+        // T.untyped はフィルタされ、具体型のみ残る
+        let cfg_input = r#"method ::Foo#bar {
+
+bb0[firstDead=-1]():
+    <self>: Foo = cast(<self>: NilClass, Foo);
+    @cache$2: T.untyped = alias <C <undeclared-field-stub>> (@cache)
+    <finalReturn>: T.noreturn = return @cache$2: T.untyped
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+bb2[firstDead=-1]():
+    <self>: Foo = cast(<self>: NilClass, Foo);
+    <statTemp>$3: String = <self>: Foo.compute()
+    @cache$2: String = <statTemp>$3: String
+    <finalReturn>: T.noreturn = return @cache$2: String
+    <unconditional> -> bb1
+
+}"#;
+
+        let symbol_json = r#"{
+            "id": 24,
+            "name": { "kind": "CONSTANT", "name": "<root>" },
+            "kind": "CLASS_OR_MODULE",
+            "children": [
+                {
+                    "id": 100,
+                    "name": { "kind": "CONSTANT", "name": "Foo" },
+                    "kind": "CLASS_OR_MODULE",
+                    "children": []
+                }
+            ]
+        }"#;
+
+        let cfg_methods = cfg_text::parse(cfg_input).unwrap();
+        let symbol_tree = symbol_table::parse(symbol_json).unwrap();
+        let autogen_files = autogen::parse("").unwrap();
+
+        let project = build(cfg_methods, symbol_tree, autogen_files);
+
+        let methods = project.find_methods("Foo#bar");
+        assert_eq!(methods.len(), 1);
+        let m = &methods[0];
+        // T.untyped がフィルタされ、String のみ残る
+        assert_eq!(m.return_type, Some(SorbetType::Simple("String".into())));
+    }
+
+    #[test]
+    fn test_return_type_all_untyped_becomes_none() {
+        // 全ての return が T.untyped → return_type は None
+        let cfg_input = r#"method ::Foo#baz {
+
+bb0[firstDead=-1]():
+    <self>: Foo = cast(<self>: NilClass, Foo);
+    @val$2: T.untyped = alias <C <undeclared-field-stub>> (@val)
+    <finalReturn>: T.noreturn = return @val$2: T.untyped
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+}"#;
+
+        let symbol_json = r#"{
+            "id": 24,
+            "name": { "kind": "CONSTANT", "name": "<root>" },
+            "kind": "CLASS_OR_MODULE",
+            "children": [
+                {
+                    "id": 100,
+                    "name": { "kind": "CONSTANT", "name": "Foo" },
+                    "kind": "CLASS_OR_MODULE",
+                    "children": []
+                }
+            ]
+        }"#;
+
+        let cfg_methods = cfg_text::parse(cfg_input).unwrap();
+        let symbol_tree = symbol_table::parse(symbol_json).unwrap();
+        let autogen_files = autogen::parse("").unwrap();
+
+        let project = build(cfg_methods, symbol_tree, autogen_files);
+
+        let methods = project.find_methods("Foo#baz");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].return_type, None);
+    }
+
+    #[test]
+    fn test_return_type_multiple_concrete_becomes_union() {
+        // 複数の具体型 + T.untyped → T.untyped がフィルタされ Union になる
+        let cfg_input = r#"method ::Foo#multi {
+
+bb0[firstDead=-1]():
+    <self>: Foo = cast(<self>: NilClass, Foo);
+    @val$2: T.untyped = alias <C <undeclared-field-stub>> (@val)
+    <finalReturn>: T.noreturn = return @val$2: T.untyped
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+bb2[firstDead=-1]():
+    <statTemp>$3: String = <self>: Foo.name()
+    <finalReturn>: T.noreturn = return <statTemp>$3: String
+    <unconditional> -> bb1
+
+bb3[firstDead=-1]():
+    <statTemp>$4: Integer = <self>: Foo.id()
+    <finalReturn>: T.noreturn = return <statTemp>$4: Integer
+    <unconditional> -> bb1
+
+}"#;
+
+        let symbol_json = r#"{
+            "id": 24,
+            "name": { "kind": "CONSTANT", "name": "<root>" },
+            "kind": "CLASS_OR_MODULE",
+            "children": [
+                {
+                    "id": 100,
+                    "name": { "kind": "CONSTANT", "name": "Foo" },
+                    "kind": "CLASS_OR_MODULE",
+                    "children": []
+                }
+            ]
+        }"#;
+
+        let cfg_methods = cfg_text::parse(cfg_input).unwrap();
+        let symbol_tree = symbol_table::parse(symbol_json).unwrap();
+        let autogen_files = autogen::parse("").unwrap();
+
+        let project = build(cfg_methods, symbol_tree, autogen_files);
+
+        let methods = project.find_methods("Foo#multi");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(
+            methods[0].return_type,
+            Some(SorbetType::Union(vec![
+                SorbetType::Simple("String".into()),
+                SorbetType::Simple("Integer".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_sig_return_type_overrides_cfg() {
+        // CFG が T.untyped を返すが、sig_return_type で上書きされる
+        let cfg_input = r#"method ::Foo#booths {
+
+bb0[firstDead=-1]():
+    <self>: Foo = cast(<self>: NilClass, Foo);
+    @booths$2: T.untyped = alias <C <undeclared-field-stub>> (@booths)
+    <finalReturn>: T.noreturn = return @booths$2: T.untyped
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+}"#;
+
+        let symbol_json = r#"{
+            "id": 24,
+            "name": { "kind": "CONSTANT", "name": "<root>" },
+            "kind": "CLASS_OR_MODULE",
+            "children": [
+                {
+                    "id": 100,
+                    "name": { "kind": "CONSTANT", "name": "Foo" },
+                    "kind": "CLASS_OR_MODULE",
+                    "children": []
+                }
+            ]
+        }"#;
+
+        let autogen_input = r#"# ParsedFile: ./app/models/foo.rb
+requires: []
+## defs:
+[def id=0]
+ type=class
+ defines_behavior=1
+ is_empty=0
+ defining_ref=[Foo]
+## refs:
+[ref id=0]
+ scope=[]
+ name=[Foo]
+ nesting=[]
+ resolved=[Foo]
+ loc=app/models/foo.rb:1
+ is_defining_ref=1"#;
+
+        let cfg_methods = cfg_text::parse(cfg_input).unwrap();
+        let symbol_tree = symbol_table::parse(symbol_json).unwrap();
+        let autogen_files = autogen::parse(autogen_input).unwrap();
+
+        let mut project = build(cfg_methods, symbol_tree, autogen_files);
+
+        // CFG だけだと return_type は None (all untyped filtered)
+        assert_eq!(project.find_methods("Foo#booths")[0].return_type, None);
+
+        // parse-tree の sig 情報を適用
+        use crate::parser::parse_tree::MethodLoc;
+        let locs = vec![MethodLoc {
+            file: "app/models/foo.rb".to_string(),
+            name: "booths".to_string(),
+            line: 5,
+            is_class_method: false,
+            sig_return_type: Some("Booth::PrivateRelation".to_string()),
+        }];
+        project.resolve_source_locations_from_locs(&locs);
+
+        let methods = project.find_methods("Foo#booths");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(
+            methods[0].return_type,
+            Some(SorbetType::Simple("Booth::PrivateRelation".into()))
+        );
+        assert_eq!(methods[0].line, Some(5));
     }
 }

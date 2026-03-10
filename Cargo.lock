@@ -435,11 +435,12 @@ name = "srb-lens-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde_json",
  "srb-lens",
 ]
 
 [[package]]
-name = "srb_lens_ruby"
+name = "srb_lens"
 version = "0.1.0"
 dependencies = [
  "magnus",

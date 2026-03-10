@@ -63,6 +63,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Dump entire project as JSON to stdout
+    Dump {
+        /// Project root directory (default: current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+
+        /// Force re-index before dumping
+        #[arg(long)]
+        index: bool,
+
+        /// Command to run Sorbet (e.g. "bundle exec srb")
+        #[arg(long, default_value = "srb")]
+        srb_command: String,
+    },
     /// Read cfg-text from stdin and query (for piping)
     Pipe {
         /// "Foo#bar", "Foo.bar", or "Foo"
@@ -94,6 +108,11 @@ fn main() {
             list,
             json,
         }) => cmd_query(&query, dir, index, &srb_command, cfg, symbols, autogen, list, json),
+        Some(Commands::Dump {
+            dir,
+            index,
+            srb_command,
+        }) => cmd_dump(dir, index, &srb_command),
         Some(Commands::Pipe { query, list, json }) => cmd_pipe(&query, list, json),
         None => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -133,6 +152,28 @@ fn cmd_index(dir: Option<PathBuf>, srb_command: &str) {
             process::exit(1);
         }
     }
+}
+
+fn cmd_dump(dir: Option<PathBuf>, force_index: bool, srb_command: &str) {
+    let root =
+        dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cmd = SrbCommand::new(srb_command);
+
+    let project = if force_index {
+        eprintln!("Indexing {} ...", root.display());
+        indexer::index(&root, &cmd)
+    } else {
+        indexer::load_or_index(&root, &cmd)
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+
+    serde_json::to_writer(io::stdout().lock(), &project).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
 }
 
 fn cmd_query(
@@ -312,8 +353,7 @@ fn print_method_text(
     if !m.arguments.is_empty() {
         println!("  args:");
         for arg in &m.arguments {
-            let opt = if arg.is_optional { " (optional)" } else { "" };
-            println!("    {}: {}{opt}", arg.name, arg.ty);
+            println!("    {}: {} ({:?})", arg.name, arg.ty, arg.kind);
         }
     }
 
@@ -423,8 +463,8 @@ fn print_method_json(m: &srb_lens::model::MethodInfo, project: &srb_lens::model:
         .iter()
         .map(|a| {
             format!(
-                r#"{{"name":"{}","type":"{}","optional":{}}}"#,
-                a.name, a.ty, a.is_optional
+                r#"{{"name":"{}","type":"{}","kind":"{:?}"}}"#,
+                a.name, a.ty, a.kind
             )
         })
         .collect();

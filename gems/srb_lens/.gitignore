@@ -1,0 +1,5 @@
+/tmp/
+/lib/srb_lens/srb_lens.so
+*.so
+*.bundle
+*.dll
