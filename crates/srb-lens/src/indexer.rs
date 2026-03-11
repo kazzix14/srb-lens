@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use crate::builder;
 use crate::model::Project;
@@ -61,6 +61,8 @@ impl SrbCommand {
         cmd.arg("tc");
         cmd.args(extra_args);
         cmd.arg("--no-error-count");
+        let sorbet_cache = cache_dir(project_root).join("sorbet-cache");
+        cmd.arg(format!("--cache-dir={}", sorbet_cache.display()));
         cmd.env("SRB_SKIP_GEM_RBIS", "1");
         cmd.stderr(std::process::Stdio::null());
         cmd
@@ -80,33 +82,82 @@ pub fn cache_exists(project_root: &Path) -> bool {
 
 /// Sorbet を実行して .srb-lens/ にキャッシュを保存
 pub fn index(project_root: &Path, srb_command: &SrbCommand) -> Result<Project, IndexError> {
+    let total_start = Instant::now();
     let dir = cache_dir(project_root);
     fs::create_dir_all(&dir)?;
 
-    let cfg_output = run_sorbet(project_root, srb_command, &["--print=cfg-text"])?;
-    fs::write(dir.join(CFG_FILE), &cfg_output)?;
-
-    let symbols_output = run_sorbet(project_root, srb_command, &["--print=symbol-table-json"])?;
-    fs::write(dir.join(SYMBOLS_FILE), &symbols_output)?;
-
-    let autogen_output = run_sorbet(
+    // 1回目: cfg-text + symbol-table-json（フル解析）
+    let t = Instant::now();
+    let combined_output = run_sorbet(
         project_root,
         srb_command,
-        &["--print=autogen", "--stop-after=namer"],
+        &["--print=symbol-table-json", "--print=cfg-text"],
     )?;
-    fs::write(dir.join(AUTOGEN_FILE), &autogen_output)?;
+    eprintln!("[srb-lens] sorbet (cfg+symbols):   {:>8.2?}", t.elapsed());
 
-    let parse_tree_output = run_sorbet(
+    let t = Instant::now();
+    let (symbols_output, cfg_output) = split_symbols_and_cfg(&combined_output)?;
+    fs::write(dir.join(SYMBOLS_FILE), symbols_output)?;
+    fs::write(dir.join(CFG_FILE), cfg_output)?;
+    eprintln!("[srb-lens] split + write:          {:>8.2?}", t.elapsed());
+
+    // 2回目: autogen + parse-tree-json-with-locs（namer まで）
+    let t = Instant::now();
+    let combined_output2 = run_sorbet(
         project_root,
         srb_command,
-        &["--print=parse-tree-json-with-locs", "--stop-after=parser"],
+        &[
+            "--print=parse-tree-json-with-locs",
+            "--print=autogen",
+            "--stop-after=namer",
+        ],
     )?;
-    let method_locs = parse_tree::parse(&parse_tree_output)?;
+    eprintln!("[srb-lens] sorbet (tree+autogen):  {:>8.2?}", t.elapsed());
+
+    let t = Instant::now();
+    let (parse_tree_output, autogen_output) = split_parse_tree_and_autogen(&combined_output2);
+    fs::write(dir.join(AUTOGEN_FILE), autogen_output)?;
+
+    let method_locs = parse_tree::parse(parse_tree_output)?;
     let method_locs_json =
         serde_json::to_string(&method_locs).map_err(|e| IndexError::SorbetOutput(e.to_string()))?;
     fs::write(dir.join(METHOD_LOCS_FILE), &method_locs_json)?;
+    eprintln!("[srb-lens] parse + write locs:     {:>8.2?}", t.elapsed());
 
-    load_from_cache(project_root)
+    let t = Instant::now();
+    let project = load_from_cache(project_root)?;
+    eprintln!("[srb-lens] load_from_cache:        {:>8.2?}", t.elapsed());
+    eprintln!("[srb-lens] total index:            {:>8.2?}", total_start.elapsed());
+
+    Ok(project)
+}
+
+/// symbol-table-json（1つの巨大JSON）と cfg-text（"method " で始まる行群）を分割する。
+/// Sorbet は symbol-table-json を先に出力し、その直後に cfg-text を出力する。
+fn split_symbols_and_cfg(output: &str) -> Result<(&str, &str), IndexError> {
+    // cfg-text の最初の "method " 行を探す。その直前が JSON の終わり。
+    // "\nmethod " で検索して、JSON部分と cfg部分に分割。
+    if let Some(pos) = output.find("\nmethod ") {
+        let symbols = &output[..pos];
+        let cfg = &output[pos + 1..]; // '\n' をスキップ
+        Ok((symbols, cfg))
+    } else {
+        // cfg-text が空の場合（メソッドが1つもない場合）、全体が symbol-table-json
+        Ok((output, ""))
+    }
+}
+
+/// parse-tree-json-with-locs と autogen を分割する。
+/// parse-tree は改行区切りJSON、autogen は "# ParsedFile:" で始まる。
+fn split_parse_tree_and_autogen(output: &str) -> (&str, &str) {
+    if let Some(pos) = output.find("\n# ParsedFile:") {
+        let parse_tree = &output[..pos];
+        let autogen = &output[pos + 1..]; // '\n' をスキップ
+        (parse_tree, autogen)
+    } else {
+        // autogen が空の場合、全体が parse-tree
+        (output, "")
+    }
 }
 
 /// キャッシュから Project をロード
