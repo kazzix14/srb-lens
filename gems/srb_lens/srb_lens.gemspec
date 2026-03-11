@@ -1,6 +1,6 @@
 Gem::Specification.new do |spec|
   spec.name = "srb_lens"
-  spec.version = "0.1.0"
+  spec.version = "0.2.0"
   spec.authors = ["kazzix14"]
   spec.email = ["kazzix14@gmail.com"]
   spec.summary = "Ruby bindings for srb-lens (Sorbet code analysis)"
