@@ -2,6 +2,12 @@
 name = "srb-lens"
 version = "0.1.0"
 edition = "2024"
+description = "Static analysis tool for Sorbet-typed Ruby projects — extracts method signatures, call graphs, and type information from Sorbet's CFG, symbol table, and parse tree"
+license = "MIT"
+repository = "https://github.com/kazzix14/srb-lens"
+authors = ["kazzix14"]
+keywords = ["sorbet", "ruby", "static-analysis", "type-checker"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

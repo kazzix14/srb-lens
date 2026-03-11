@@ -2,10 +2,15 @@
 name = "srb_lens"
 version = "0.1.0"
 edition = "2024"
+description = "Ruby native extension for srb-lens"
+license = "MIT"
+repository = "https://github.com/kazzix14/srb-lens"
+authors = ["kazzix14"]
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
 magnus = { version = "0.7", features = ["rb-sys"] }
-srb-lens = { path = "../../../../crates/srb-lens" }
+srb-lens = { version = "0.1.0", path = "../../../../crates/srb-lens" }
