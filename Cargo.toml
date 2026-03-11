@@ -2,3 +2,6 @@
 members = ["crates/srb-lens", "crates/srb-lens-cli", "gems/srb_lens/ext/srb_lens"]
 default-members = ["crates/srb-lens", "crates/srb-lens-cli"]
 resolver = "3"
+
+[patch.crates-io]
+srb-lens = { path = "crates/srb-lens" }
