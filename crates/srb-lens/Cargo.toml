@@ -1,6 +1,6 @@
 [package]
 name = "srb-lens"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Static analysis tool for Sorbet-typed Ruby projects — extracts method signatures, call graphs, and type information from Sorbet's CFG, symbol table, and parse tree"
 license = "MIT"

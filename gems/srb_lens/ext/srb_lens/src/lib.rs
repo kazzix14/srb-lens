@@ -13,7 +13,7 @@ fn ruby() -> Ruby {
 }
 
 fn err(msg: String) -> Error {
-    Error::new(magnus::exception::runtime_error(), msg)
+    Error::new(ruby().exception_runtime_error(), msg)
 }
 
 // ─── Project ────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ impl RbProject {
             SrbCommand::default()
         } else {
             let val: Option<String> =
-                parsed.keywords.aref(magnus::Symbol::new("srb_command"))?;
+                parsed.keywords.aref(ruby().to_symbol("srb_command"))?;
             match val {
                 Some(cmd) => SrbCommand::new(&cmd),
                 None => SrbCommand::default(),
@@ -55,7 +55,7 @@ impl RbProject {
             SrbCommand::default()
         } else {
             let val: Option<String> =
-                parsed.keywords.aref(magnus::Symbol::new("srb_command"))?;
+                parsed.keywords.aref(ruby().to_symbol("srb_command"))?;
             match val {
                 Some(cmd) => SrbCommand::new(&cmd),
                 None => SrbCommand::default(),
