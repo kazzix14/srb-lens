@@ -3,3 +3,4 @@
 *.so
 *.bundle
 *.dll
+*.gem
