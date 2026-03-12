@@ -276,6 +276,7 @@ pub struct MethodCall {
     pub receiver_type: SorbetType,
     pub method_name: String,
     pub return_type: SorbetType,
+    pub target_fqn: Option<String>,
     pub bb_id: usize,
     pub conditions: Vec<BranchCondition>,
 }

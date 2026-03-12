@@ -35,7 +35,80 @@ pub fn build(
         }
     }
 
+    // 4. target_fqn を解決
+    resolve_target_fqns(&mut project);
+
     project
+}
+
+/// receiver_type から (class_name, method_kind) を抽出
+fn extract_receiver_class(ty: &SorbetType) -> Option<(String, MethodKind)> {
+    match ty {
+        SorbetType::ClassOf(name) => Some((name.clone(), MethodKind::Class)),
+        SorbetType::Simple(name) => Some((name.clone(), MethodKind::Instance)),
+        SorbetType::Nilable(inner) => extract_receiver_class(inner),
+        _ => None,
+    }
+}
+
+/// 全 MethodCall の target_fqn を解決する
+fn resolve_target_fqns(project: &mut Project) {
+    // class_fqn → method_fqns のルックアップ用にクローン
+    let class_method_map: HashMap<String, Vec<MethodFqn>> = project
+        .classes
+        .iter()
+        .map(|(fqn, c)| (fqn.clone(), c.method_fqns.clone()))
+        .collect();
+    let superclass_map: HashMap<String, Option<String>> = project
+        .classes
+        .iter()
+        .map(|(fqn, c)| (fqn.clone(), c.super_class.clone()))
+        .collect();
+
+    for method in &mut project.methods {
+        for call in &mut method.calls {
+            let Some((class_name, kind)) = extract_receiver_class(&call.receiver_type) else {
+                continue;
+            };
+
+            let sep = match kind {
+                MethodKind::Instance => "#",
+                MethodKind::Class => ".",
+            };
+
+            // superclass チェーンを辿ってメソッド定義を探す
+            let mut current = Some(class_name.clone());
+            let mut visited = HashSet::new();
+            let mut found = false;
+
+            while let Some(ref cls) = current {
+                if !visited.insert(cls.clone()) {
+                    break;
+                }
+                if let Some(method_fqns) = class_method_map.get(cls) {
+                    if method_fqns
+                        .iter()
+                        .any(|fqn| fqn.method_name == call.method_name && fqn.kind == kind)
+                    {
+                        call.target_fqn = Some(format!("{cls}{sep}{}", call.method_name));
+                        found = true;
+                        break;
+                    }
+                }
+                current = superclass_map
+                    .get(cls)
+                    .and_then(|s| s.clone());
+            }
+
+            if !found {
+                // クラスは存在するがメソッド定義が見つからない場合 → receiver のクラスで FQN 生成
+                if class_method_map.contains_key(&class_name) || superclass_map.contains_key(&class_name) {
+                    call.target_fqn = Some(format!("{class_name}{sep}{}", call.method_name));
+                }
+                // クラス自体が不明 → None のまま
+            }
+        }
+    }
 }
 
 fn build_classes_from_symbols(
@@ -225,6 +298,7 @@ fn extract_method_info(cfg_method: &CfgMethod) -> Option<MethodInfo> {
                             receiver_type: parse_sorbet_type(&receiver.ty),
                             method_name: method_name.clone(),
                             return_type: parse_sorbet_type(&lhs.ty),
+                            target_fqn: None, // resolved in post-process
                             bb_id: block.id,
                             conditions: Vec::new(), // filled in later
                         });
@@ -1175,5 +1249,104 @@ requires: []
             Some(SorbetType::Simple("Booth::PrivateRelation".into()))
         );
         assert_eq!(methods[0].line, Some(5));
+    }
+
+    #[test]
+    fn test_target_fqn_resolution() {
+        // Parent has method "greet", Child inherits it.
+        // Child calls self.greet() → target_fqn should resolve to "Parent#greet".
+        // Child also calls self.name() which is defined on Child.
+        // Also tests ClassOf receiver → class method resolution.
+        let cfg_input = r#"method ::Child#run {
+
+bb0[firstDead=-1]():
+    <self>: Child = cast(<self>: NilClass, Child);
+    <statTemp>$2: String = <self>: Child.greet()
+    <statTemp>$3: String = <self>: Child.name()
+    <statTemp>$4: Child = <self>: T.class_of(Child).create()
+    <statTemp>$5: Integer = <statTemp>$2: String.length()
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+}
+method ::Parent#greet {
+
+bb0[firstDead=-1]():
+    <self>: Parent = cast(<self>: NilClass, Parent);
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+}
+method ::Child#name {
+
+bb0[firstDead=-1]():
+    <self>: Child = cast(<self>: NilClass, Child);
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+}
+method ::<Class:Child>#create {
+
+bb0[firstDead=-1]():
+    <self>: T.class_of(Child) = cast(<self>: NilClass, T.class_of(Child));
+    <unconditional> -> bb1
+
+bb1[firstDead=-1]():
+    <unconditional> -> bb1
+
+}"#;
+
+        let symbol_json = r#"{
+            "id": 24,
+            "name": { "kind": "CONSTANT", "name": "<root>" },
+            "kind": "CLASS_OR_MODULE",
+            "children": [
+                {
+                    "id": 100,
+                    "name": { "kind": "CONSTANT", "name": "Parent" },
+                    "kind": "CLASS_OR_MODULE",
+                    "children": []
+                },
+                {
+                    "id": 101,
+                    "name": { "kind": "CONSTANT", "name": "Child" },
+                    "kind": "CLASS_OR_MODULE",
+                    "superClass": 100,
+                    "children": []
+                }
+            ]
+        }"#;
+
+        let cfg_methods = cfg_text::parse(cfg_input).unwrap();
+        let symbol_tree = symbol_table::parse(symbol_json).unwrap();
+        let autogen_files = autogen::parse("").unwrap();
+
+        let project = build(cfg_methods, symbol_tree, autogen_files);
+
+        let methods = project.find_methods("Child#run");
+        assert_eq!(methods.len(), 1);
+        let m = &methods[0];
+
+        // greet() is defined on Parent, resolved via superclass chain
+        let greet_call = m.calls.iter().find(|c| c.method_name == "greet").unwrap();
+        assert_eq!(greet_call.target_fqn.as_deref(), Some("Parent#greet"));
+
+        // name() is defined on Child directly
+        let name_call = m.calls.iter().find(|c| c.method_name == "name").unwrap();
+        assert_eq!(name_call.target_fqn.as_deref(), Some("Child#name"));
+
+        // create() via ClassOf receiver → class method
+        let create_call = m.calls.iter().find(|c| c.method_name == "create").unwrap();
+        assert_eq!(create_call.target_fqn.as_deref(), Some("Child.create"));
+
+        // length() on String — String class unknown → None
+        let length_call = m.calls.iter().find(|c| c.method_name == "length").unwrap();
+        assert_eq!(length_call.target_fqn, None);
     }
 }
