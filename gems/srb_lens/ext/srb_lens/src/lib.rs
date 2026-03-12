@@ -318,6 +318,7 @@ struct RbMethodCall {
     receiver_type: String,
     method_name: String,
     return_type: String,
+    target_fqn: Option<String>,
     conditions: Vec<model::BranchCondition>,
 }
 
@@ -327,6 +328,7 @@ impl RbMethodCall {
             receiver_type: c.receiver_type.to_string(),
             method_name: c.method_name.clone(),
             return_type: c.return_type.to_string(),
+            target_fqn: c.target_fqn.clone(),
             conditions: c.conditions.clone(),
         }
     }
@@ -341,6 +343,10 @@ impl RbMethodCall {
 
     fn return_type(&self) -> &str {
         &self.return_type
+    }
+
+    fn target_fqn(&self) -> Option<&str> {
+        self.target_fqn.as_deref()
     }
 
     fn conditions(&self) -> RArray {
@@ -468,6 +474,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     method_call.define_method("receiver_type", method!(RbMethodCall::receiver_type, 0))?;
     method_call.define_method("method_name", method!(RbMethodCall::method_name, 0))?;
     method_call.define_method("return_type", method!(RbMethodCall::return_type, 0))?;
+    method_call.define_method("target_fqn", method!(RbMethodCall::target_fqn, 0))?;
     method_call.define_method("conditions", method!(RbMethodCall::conditions, 0))?;
 
     // BranchCondition
