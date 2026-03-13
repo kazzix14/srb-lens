@@ -319,9 +319,11 @@ fn extract_method_info(cfg_method: &CfgMethod) -> Option<MethodInfo> {
                         });
                     }
                 }
-                // ivar write via assignment or cast
+                // ivar write via assignment, cast, literal, or block solve
                 CfgInstruction::Assignment { lhs, .. }
-                | CfgInstruction::Cast { lhs, .. } => {
+                | CfgInstruction::Cast { lhs, .. }
+                | CfgInstruction::Literal { lhs, .. }
+                | CfgInstruction::Solve { lhs, .. } => {
                     if lhs.name.starts_with('@') {
                         ivars.push(IvarAccess {
                             name: strip_ssa_suffix(&lhs.name).to_string(),
@@ -882,6 +884,12 @@ bb0[firstDead=-1]():
     @booths$6: T.untyped = alias <C <undeclared-field-stub>> (@booths)
     <statTemp>$7: Account = <self>: Campaign.current_account!()
     @booths$6: Booth::PrivateRelation = <statTemp>$7: Account.booths()
+    @test$12: T.untyped = alias <C <undeclared-field-stub>> (@test)
+    @test$12: String("test") = "test"
+    @flag$14: T.untyped = alias <C <undeclared-field-stub>> (@flag)
+    @flag$14: TrueClass = true
+    @items$16: T.untyped = alias <C <undeclared-field-stub>> (@items)
+    @items$16: T::Array[RewardItem] = Solve<<block-pre-call-temp>$17, map>
     <returnMethodTemp>$2: T::Boolean = <statTemp>$5: Time.<=>(at: Time)
     <finalReturn>: T.noreturn = return <returnMethodTemp>$2: T::Boolean
     <unconditional> -> bb1
@@ -951,11 +959,20 @@ requires: []
         assert_eq!(m.arguments.len(), 1);
         assert_eq!(m.arguments[0].name, "at");
         assert_eq!(m.arguments[0].kind, ArgumentKind::Opt);
-        assert_eq!(m.ivars.len(), 2);
+        assert_eq!(m.ivars.len(), 5);
         let booths_ivar = m.ivars.iter().find(|iv| iv.name == "@booths").unwrap();
         assert_eq!(booths_ivar.ty, SorbetType::Simple("Booth::PrivateRelation".into()));
         let start_at_ivar = m.ivars.iter().find(|iv| iv.name == "@start_at").unwrap();
         assert_eq!(start_at_ivar.ty, SorbetType::Untyped);
+        // Literal assignment: @test = "test" → String("test")
+        let test_ivar = m.ivars.iter().find(|iv| iv.name == "@test").unwrap();
+        assert_eq!(test_ivar.ty, SorbetType::Literal(r#"String("test")"#.into()));
+        // Literal assignment: @flag = true → TrueClass
+        let flag_ivar = m.ivars.iter().find(|iv| iv.name == "@flag").unwrap();
+        assert_eq!(flag_ivar.ty, SorbetType::Simple("TrueClass".into()));
+        // Solve (block return): @items = items.map { ... } → T::Array[RewardItem]
+        let items_ivar = m.ivars.iter().find(|iv| iv.name == "@items").unwrap();
+        assert_eq!(items_ivar.ty, SorbetType::Array(Box::new(SorbetType::Simple("RewardItem".into()))));
         assert!(m.calls.iter().any(|c| c.method_name == "start_at"));
         assert!(m.calls.iter().any(|c| c.method_name == "<=>"));
     }
