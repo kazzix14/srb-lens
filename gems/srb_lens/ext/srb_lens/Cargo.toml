@@ -1,6 +1,6 @@
 [package]
 name = "srb_lens"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Ruby native extension for srb-lens"
 license = "MIT"
@@ -13,4 +13,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 magnus = { version = "0.8", features = ["rb-sys"] }
-srb-lens = "0.5.0"
+srb-lens = "0.5.1"

@@ -133,17 +133,28 @@ pub fn index(project_root: &Path, srb_command: &SrbCommand) -> Result<Project, I
 }
 
 /// symbol-table-json（1つの巨大JSON）と cfg-text（"method " で始まる行群）を分割する。
-/// Sorbet は symbol-table-json を先に出力し、その直後に cfg-text を出力する。
+/// Sorbet のバージョンにより出力順が異なる（JSON先 or CFG先）ため、
+/// 先頭文字で判定してどちらの順序でも対応する。
 fn split_symbols_and_cfg(output: &str) -> Result<(&str, &str), IndexError> {
-    // cfg-text の最初の "method " 行を探す。その直前が JSON の終わり。
-    // "\nmethod " で検索して、JSON部分と cfg部分に分割。
-    if let Some(pos) = output.find("\nmethod ") {
-        let symbols = &output[..pos];
-        let cfg = &output[pos + 1..]; // '\n' をスキップ
-        Ok((symbols, cfg))
+    if output.starts_with('{') {
+        // JSON が先、CFG が後
+        if let Some(pos) = output.find("\nmethod ") {
+            let symbols = &output[..pos];
+            let cfg = &output[pos + 1..];
+            Ok((symbols, cfg))
+        } else {
+            Ok((output, ""))
+        }
     } else {
-        // cfg-text が空の場合（メソッドが1つもない場合）、全体が symbol-table-json
-        Ok((output, ""))
+        // CFG が先、JSON が後
+        // CFG テキスト中では行頭に "{" が来ることはないので "\n{" で JSON の開始を検出
+        if let Some(pos) = output.find("\n{") {
+            let cfg = &output[..pos];
+            let symbols = &output[pos + 1..];
+            Ok((symbols, cfg))
+        } else {
+            Ok(("", output))
+        }
     }
 }
 
@@ -294,4 +305,42 @@ pub enum IndexError {
     AutogenParse(#[from] autogen::AutogenParseError),
     #[error("parse-tree error: {0}")]
     ParseTree(#[from] parse_tree::ParseTreeError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_JSON: &str = r#"{"classes":[{"name":"Foo"}]}"#;
+    const SAMPLE_CFG: &str = "method ::Foo#bar () {\nbb0:\n  return\n}";
+
+    #[test]
+    fn split_json_first() {
+        let output = format!("{}\n{}", SAMPLE_JSON, SAMPLE_CFG);
+        let (symbols, cfg) = split_symbols_and_cfg(&output).unwrap();
+        assert_eq!(symbols, SAMPLE_JSON);
+        assert_eq!(cfg, SAMPLE_CFG);
+    }
+
+    #[test]
+    fn split_cfg_first() {
+        let output = format!("{}\n{}", SAMPLE_CFG, SAMPLE_JSON);
+        let (symbols, cfg) = split_symbols_and_cfg(&output).unwrap();
+        assert_eq!(symbols, SAMPLE_JSON);
+        assert_eq!(cfg, SAMPLE_CFG);
+    }
+
+    #[test]
+    fn split_json_only() {
+        let (symbols, cfg) = split_symbols_and_cfg(SAMPLE_JSON).unwrap();
+        assert_eq!(symbols, SAMPLE_JSON);
+        assert_eq!(cfg, "");
+    }
+
+    #[test]
+    fn split_cfg_only() {
+        let (symbols, cfg) = split_symbols_and_cfg(SAMPLE_CFG).unwrap();
+        assert_eq!(symbols, "");
+        assert_eq!(cfg, SAMPLE_CFG);
+    }
 }
